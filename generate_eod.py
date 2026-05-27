@@ -1,0 +1,497 @@
+"""
+generate_eod.py
+===============
+Run this script at End of Day (after 3:30 PM) to generate
+a dated EOD positions CSV from today's log file.
+
+This CSV is used by dashboard_worker.py next morning as
+overnight positions (qty_overnight + prev_close).
+
+Output:
+    [SSH] 192.168.74.138:/data/Dashboard/Eod/eod_positions_YYYYMMDD.csv
+
+Usage:
+    python generate_eod.py              # uses today's date
+    python generate_eod.py 20260509     # uses specific date
+
+Format of output CSV:
+    token, symbol, qty_overnight, prev_close, date
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import csv
+import logging
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from io import StringIO
+
+import paramiko
+import redis
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG — same as dashboard_worker.py
+# ══════════════════════════════════════════════════════════════
+SSH_HOST     = os.getenv("SSH_HOST",     "192.168.71.200")
+SSH_PORT     = int(os.getenv("SSH_PORT", "22"))
+SSH_USER     = os.getenv("SSH_USER",     "Data_colo")
+SSH_PASS     = os.getenv("SSH_PASS",     "Datacolo@2026")
+
+REMOTE_LOG_DIR       = os.getenv("REMOTE_LOG_DIR",       "/data/logs")
+REMOTE_DASHBOARD_DIR = os.getenv("REMOTE_DASHBOARD_DIR", "/data/Dashboard")
+REMOTE_PCAP_DIR      = os.getenv("REMOTE_PCAP_DIR",      "/data/pcapdata")
+
+PRICE_DIVISOR = 100.0
+NSE_OFFSET    = 315513000   # seconds
+
+EOD_SUBDIR = "Eod"   # subfolder under REMOTE_DASHBOARD_DIR
+
+
+def eod_output_path(dt: str) -> str:
+    """
+    Returns dated EOD CSV path on colo.
+    e.g. /data/Dashboard/Eod/eod_positions_20260514.csv
+    dt must be YYYYMMDD.
+    """
+    return f"{REMOTE_DASHBOARD_DIR}/{EOD_SUBDIR}/eod_positions_{dt}.csv"
+
+# Redis for prev_close (stock_realtime_feeder — DB 2)
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB   = int(os.getenv("LTP_REDIS_DB", "2"))
+
+# ══════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("generate_eod")
+logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+# ══════════════════════════════════════════════════════════════
+# REGEX
+# ══════════════════════════════════════════════════════════════
+FTRD_RE = re.compile(
+    r"FTRD:"
+    r"(\d+),"           # transactioncode
+    r"([\d.]+),"        # response_ordernumber
+    r"(\d+),"           # buy_sell  (1=Buy, 2=Sell)
+    r"(-?\d+),"         # originalvol
+    r"(-?\d+),"         # remaining_vol
+    r"(\d+),"           # price
+    r"(\d+),"           # fillnumber
+    r"(\d+),"           # fillqty
+    r"(\d+),"           # fillprice
+    r"(\d+)"            # token
+)
+
+# ══════════════════════════════════════════════════════════════
+# SSH HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def get_ssh_client() -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(SSH_HOST, port=SSH_PORT,
+                   username=SSH_USER, password=SSH_PASS, timeout=10)
+    return client
+
+
+def read_remote_file_lines(remote_path: str) -> list[str]:
+    try:
+        client = get_ssh_client()
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(remote_path, "r") as f:
+                lines = f.read().decode("utf-8", errors="replace").splitlines()
+            log.info("Read %d lines from %s:%s", len(lines), SSH_HOST, remote_path)
+            return lines
+        except FileNotFoundError:
+            log.warning("File not found: %s:%s", SSH_HOST, remote_path)
+            return []
+        finally:
+            sftp.close()
+            client.close()
+    except Exception as e:
+        log.error("SSH read failed: %s", e)
+        return []
+
+
+def write_remote_file(remote_path: str, content: str):
+    try:
+        client = get_ssh_client()
+        sftp = client.open_sftp()
+        with sftp.open(remote_path, "w") as f:
+            f.write(content)
+        sftp.close()
+        client.close()
+        log.info("Written to %s:%s", SSH_HOST, remote_path)
+    except Exception as e:
+        log.error("SSH write failed: %s", e)
+
+
+def run_remote_cmd(cmd: str) -> str:
+    try:
+        client = get_ssh_client()
+        _, stdout, _ = client.exec_command(cmd)
+        result = stdout.read().decode().strip()
+        client.close()
+        return result
+    except Exception as e:
+        log.error("SSH cmd failed: %s", e)
+        return ""
+
+# ══════════════════════════════════════════════════════════════
+# DATE / PATH HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def today_str() -> str:
+    return date.today().strftime("%Y%m%d")
+
+
+def detect_latest_log() -> tuple[str, str]:
+    """
+    Returns (log_path, date_str) of the latest log on remote.
+    Uses actual fill timestamps (not filename) for accurate trade date.
+    """
+    path = run_remote_cmd(
+        f"ls -t {REMOTE_LOG_DIR}/*algo_1_*.log 2>/dev/null | head -1"
+    )
+    if not path:
+        raise FileNotFoundError("No log file found on remote server")
+
+    # Extract actual trade date from latest fill timestamp (not filename)
+    # Filename date may be stale — fill timestamps are accurate
+    last_fill = run_remote_cmd(
+        f"timeout 10 tac {path} | grep -m1 'emit_trade_fill::FTRD'"
+    )
+    dt = today_str()  # fallback
+    if last_fill:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})\s", last_fill)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d").strftime("%Y%m%d")
+                log.info("Trade date from fill timestamp: %s", dt)
+            except Exception:
+                pass
+
+    if dt == today_str():
+        # fallback: try filename date
+        m = re.search(r"(\d{8})", os.path.basename(path))
+        if m:
+            dt = m.group(1)
+
+    return path, dt
+
+
+def find_contract_file(dt: str) -> str:
+    """Find contract CSV for given date, fallback to latest."""
+    primary = f"{REMOTE_PCAP_DIR}/{dt}/fo_contract_stream_info_{dt}.csv"
+    try:
+        client = get_ssh_client()
+        sftp = client.open_sftp()
+        try:
+            sftp.stat(primary)
+            sftp.close(); client.close()
+            return primary
+        except FileNotFoundError:
+            pass
+        sftp.close()
+        latest = run_remote_cmd(
+            f"ls -t {REMOTE_PCAP_DIR}/*/fo_contract_stream_info_*.csv 2>/dev/null | head -1"
+        )
+        client.close()
+        return latest if latest else primary
+    except Exception as e:
+        log.error("Contract file search failed: %s", e)
+        return primary
+
+# ══════════════════════════════════════════════════════════════
+# CONTRACT TOKEN MAP
+# ══════════════════════════════════════════════════════════════
+
+def load_token_map(contract_path: str) -> dict[int, dict]:
+    lines = read_remote_file_lines(contract_path)
+    token_map = {}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        if len(parts) < 8:
+            continue
+        if parts[0].strip().isdigit():
+            continue
+
+        try:
+            token     = int(parts[2].strip())
+            inst_type = parts[3].strip().upper()
+            name      = parts[4].strip().upper()
+            expiry_ts = int(parts[5].strip())
+            strike    = float(parts[6].strip()) / 100.0
+            itype     = parts[7].strip().upper()
+
+            # NSE epoch fix
+            adj_ts   = expiry_ts + NSE_OFFSET if str(expiry_ts).startswith("14") else expiry_ts
+            exp_date = datetime.fromtimestamp(adj_ts, tz=ZoneInfo("Asia/Kolkata"))
+            exp_str  = exp_date.strftime("%y%b").upper()
+
+            is_future = inst_type in ("FUTSTK", "FUTIDX") or itype == "XX"
+            if is_future:
+                tsym = f"{name}{exp_str}FUT"
+            else:
+                strike_str = str(int(strike)) if strike == int(strike) else str(strike)
+                tsym = f"{name}{exp_str}{strike_str}{itype}"
+
+            token_map[token] = {
+                "name":      name,
+                "tsym":      tsym,
+                "is_future": is_future,
+            }
+        except (ValueError, IndexError):
+            continue
+
+    log.info("Token map loaded: %d contracts", len(token_map))
+    return token_map
+
+# ══════════════════════════════════════════════════════════════
+# PARSE LOG → EOD POSITIONS
+# ══════════════════════════════════════════════════════════════
+
+def parse_eod_from_log(log_path: str) -> dict[int, dict]:
+    """
+    Parse FTRD lines from log for the latest trade date only.
+
+    Uses server-side grep to fetch only today's fills — avoids reading
+    entire 1.7GB accumulated log file which contains multiple days.
+
+    Returns { token: { net_qty, last_price, buy_qty, sell_qty } }
+    net_qty    = total_buy - total_sell  → qty_overnight for next day
+    last_price = last fill price         → prev_close for next day
+    """
+    # Step 1: get latest fill date using tac (fast — reads from end)
+    last_fill = run_remote_cmd(
+        f"timeout 10 tac {log_path} | grep -m1 'emit_trade_fill::FTRD'"
+    )
+    latest_date = None
+    if last_fill:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})\s", last_fill)
+        if m:
+            latest_date = m.group(1)
+            log.info("EOD: filtering fills for date %s", latest_date)
+
+    # Step 2: grep only today's fills server-side
+    if latest_date:
+        raw = run_remote_cmd(
+            f"grep 'emit_trade_fill::FTRD' {log_path} | grep '{latest_date}'"
+        )
+    else:
+        log.warning("EOD: could not detect latest date — processing all fills")
+        raw = run_remote_cmd(f"grep 'emit_trade_fill::FTRD' {log_path}")
+
+    lines = raw.splitlines() if raw else []
+    log.info("EOD: %d fill lines found for date %s", len(lines), latest_date)
+
+    eod: dict[int, dict] = {}
+    seen: dict[tuple, dict] = {}
+
+    for line in lines:
+        m = FTRD_RE.search(line)
+        if not m:
+            continue
+        try:
+            token      = int(m.group(10))
+            fillnumber = int(m.group(7))
+            seen[(token, fillnumber)] = {
+                "token":      token,
+                "buy_sell":   int(m.group(3)),
+                "fillqty":    int(m.group(8)),
+                "fillprice":  int(m.group(9)) / PRICE_DIVISOR,
+                "fillnumber": fillnumber,
+            }
+        except (ValueError, IndexError):
+            continue
+    for line in lines:
+        m = FTRD_RE.search(line)
+        if not m:
+            continue
+        try:
+            token      = int(m.group(10))
+            fillnumber = int(m.group(7))
+            seen[(token, fillnumber)] = {
+                "token":      token,
+                "buy_sell":   int(m.group(3)),
+                "fillqty":    int(m.group(8)),
+                "fillprice":  int(m.group(9)) / PRICE_DIVISOR,
+                "fillnumber": fillnumber,
+            }
+        except (ValueError, IndexError):
+            continue
+
+    # Aggregate
+    for fill in seen.values():
+        token = fill["token"]
+        if token not in eod:
+            eod[token] = {
+                "buy_qty":    0.0,
+                "sell_qty":   0.0,
+                "last_price": 0.0,
+            }
+        if fill["buy_sell"] == 1:
+            eod[token]["buy_qty"]  += fill["fillqty"]
+        else:
+            eod[token]["sell_qty"] += fill["fillqty"]
+        eod[token]["last_price"] = fill["fillprice"]  # keep updating → last price
+
+    # Compute net qty
+    result = {}
+    for token, v in eod.items():
+        net_qty = v["buy_qty"] - v["sell_qty"]
+        result[token] = {
+            "net_qty":    net_qty,
+            "last_price": v["last_price"],
+            "buy_qty":    v["buy_qty"],
+            "sell_qty":   v["sell_qty"],
+        }
+
+    log.info("EOD positions computed: %d tokens", len(result))
+    return result
+
+# ══════════════════════════════════════════════════════════════
+# GENERATE EOD CSV
+# ══════════════════════════════════════════════════════════════
+
+def generate_eod_csv(dt: str = None):
+    # Step 1: detect log file
+    log_path, log_dt = detect_latest_log()
+    dt = dt or log_dt
+    log.info("Using log: %s (date=%s)", log_path, dt)
+
+    # Step 2: load contract map
+    contract_path = find_contract_file(dt)
+    log.info("Using contract: %s", contract_path)
+    token_map = load_token_map(contract_path)
+
+    # Step 3: parse EOD from log
+    eod = parse_eod_from_log(log_path)
+
+    # Step 4: connect Redis for prev_close
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                        decode_responses=True, socket_timeout=2.0)
+        r.ping()
+        log.info("Redis connected for prev_close (DB %d)", REDIS_DB)
+    except Exception as e:
+        log.warning("Redis not available: %s — using last fill price as prev_close", e)
+        r = None
+
+    # Step 5: build CSV rows
+    rows = []
+    for token, v in eod.items():
+        info = token_map.get(token)
+        if not info:
+            log.warning("Token %d not in contract map — skipping", token)
+            continue
+
+        name = info["name"]
+        tsym = info["tsym"]
+        is_future = info.get("is_future", False)
+
+        # Get prev_close — priority order:
+        # 1. Future LTP from last_price (fill price) — most accurate for futures carry
+        # 2. fo:stock_spot close from Redis — fallback for spot-based calc
+        # 3. last fill price — final fallback
+        prev_close = v["last_price"]  # fallback = last fill price
+        if r:
+            try:
+                if is_future:
+                    # For futures: use last fill price directly — it IS the settlement price
+                    # Also try fo:stock_spot LTP as proxy for futures close
+                    val = r.hget(f"fo:stock_spot:{name}", "ltp")
+                    if val and float(val) > 0:
+                        prev_close = float(val)
+                        log.info("prev_close for %s (%s) from spot LTP: %.2f",
+                                 name, tsym, prev_close)
+                    else:
+                        # Keep last fill price
+                        log.info("prev_close for %s (%s) using last fill: %.2f",
+                                 name, tsym, prev_close)
+                else:
+                    # For options/other: use stock spot close
+                    val = r.hget(f"fo:stock_spot:{name}", "close")
+                    if val and float(val) > 0:
+                        prev_close = float(val)
+                        log.info("prev_close for %s from spot close: %.2f",
+                                 name, prev_close)
+            except Exception as e:
+                log.warning("prev_close Redis fetch failed for %s: %s", name, e)
+
+        rows.append({
+            "token":          token,
+            "symbol":         tsym,
+            "name":           name,
+            "qty_overnight":  v["net_qty"],
+            "prev_close":     round(prev_close, 2),
+            "buy_qty":        v["buy_qty"],
+            "sell_qty":       v["sell_qty"],
+            "date":           dt,
+            "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    if not rows:
+        log.error("No rows generated — check log and contract file")
+        return
+
+    # Step 5: write CSV to remote dated path
+    output_file = eod_output_path(dt)
+    remote_eod_dir = f"{REMOTE_DASHBOARD_DIR}/{EOD_SUBDIR}"
+
+    # Ensure /data/Dashboard/Eod/ exists on colo
+    run_remote_cmd(f"mkdir -p {remote_eod_dir}")
+
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "token", "symbol", "name",
+        "qty_overnight", "prev_close",
+        "buy_qty", "sell_qty",
+        "date", "generated_at"
+    ])
+    writer.writeheader()
+    writer.writerows(rows)
+
+    write_remote_file(output_file, buf.getvalue())
+
+    # Step 6: summary
+    log.info("=" * 55)
+    log.info("  EOD CSV generated successfully!")
+    log.info("  Date     : %s", dt)
+    log.info("  Tokens   : %d", len(rows))
+    log.info("  Output   : %s:%s", SSH_HOST, output_file)
+    log.info("=" * 55)
+
+    # Print summary table
+    print("\n── EOD Position Summary ──────────────────────────────")
+    print(f"{'Symbol':<30} {'Net Qty':>10} {'Prev Close':>12}")
+    print("-" * 55)
+    for r in sorted(rows, key=lambda x: x["symbol"]):
+        net = r["qty_overnight"]
+        direction = "LONG" if net > 0 else ("SHORT" if net < 0 else "FLAT")
+        print(f"{r['symbol']:<30} {net:>10.0f} {r['prev_close']:>12.2f}  {direction}")
+    print("-" * 55)
+    print(f"Total positions: {len(rows)}")
+    print(f"Saved to       : {SSH_HOST}:{output_file}")
+    print()
+
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    dt = sys.argv[1] if len(sys.argv) > 1 else None
+    generate_eod_csv(dt)
